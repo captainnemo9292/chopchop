@@ -37,6 +37,8 @@ from typing import Optional
 import tree_sitter_java as tsj
 from tree_sitter import Language, Parser, Node
 
+from .lsp_resolver import LspResolver, CompletionInfo, normalize_type_str
+
 JAVA_LANGUAGE = Language(tsj.language())
 _parser = Parser(JAVA_LANGUAGE)
 
@@ -350,6 +352,38 @@ def parse_java_type(node: Node) -> Type:
         case _:
             return TOP
 
+_PRIMITIVE_BY_NAME: dict[str, Type] = {
+    "int": INT, "long": LONG, "short": SHORT, "byte": BYTE, "char": CHAR,
+    "float": FLOAT, "double": DOUBLE, "boolean": BOOLEAN, "void": VOID,
+}
+
+def java_type_from_string(s: Optional[str]) -> Type:
+    """Convert a (normalized) Java type string from an LSP detail into a Type.
+
+    Handles arrays (``int[]``), primitives, String, and class names.  Generic
+    arguments are already stripped by ``normalize_type_str``; unknown shapes
+    fall back to TOP so the checker stays permissive rather than wrong.
+    """
+    if not s:
+        return TOP
+    s = (normalize_type_str(s) or "").strip()
+    if not s:
+        return TOP
+    if s.endswith("[]"):
+        return ArrayType(java_type_from_string(s[:-2]))
+    if s in _PRIMITIVE_BY_NAME:
+        return _PRIMITIVE_BY_NAME[s]
+    if s == "String":
+        return STRING
+    # bare (possibly qualified) class name -> use the simple name
+    simple = s.rsplit(".", 1)[-1]
+    if not simple or not (simple[0].isalpha() or simple[0] == "_"):
+        return TOP
+    if simple == "String":
+        return STRING
+    return ClassType(simple)
+
+
 def _is_int_constant(node: Node) -> Optional[int]:
     """Return integer value if node is a compile-time integer constant, else None. §15.28"""
     match node.type:
@@ -399,9 +433,11 @@ class TypeError_:
 # ---------------------------------------------------------------------------
 
 class JavaTypeChecker:
-    def __init__(self, env: Env, hierarchy: ClassHierarchy):
+    def __init__(self, env: Env, hierarchy: ClassHierarchy,
+                 resolver: Optional[LspResolver] = None):
         self.env = env
         self.hierarchy = hierarchy
+        self.resolver = resolver
         self.errors: list[TypeError_] = []
 
     def error(self, node: Node, msg: str):
@@ -433,6 +469,8 @@ class JavaTypeChecker:
     # -----------------------------------------------------------------------
 
     def check_program(self, source: str) -> list[TypeError_]:
+        if self.resolver is not None:
+            self.resolver.set_source(source)
         tree = _parser.parse(bytes(source, "utf8"))
         self._check_block(tree.root_node, self.env, VOID)
         return self.errors
@@ -577,6 +615,17 @@ class JavaTypeChecker:
     def _check_assignment(self, node: Node, env: Env):
         children = named_children(node)
         lhs, rhs = children[0], children[1]
+
+        # Compound targets: arr[i] = e , obj.field = e — resolve the target
+        # type by inferring the LHS expression (also checks sub-expressions).
+        if lhs.type in ("array_access", "field_access"):
+            lhs_type = self._infer(lhs, env)
+            rhs_type = self._infer(rhs, env)
+            if lhs_type not in (TOP, EMPTY) and \
+                    not self.assignable_with_constant(lhs_type, rhs_type, rhs):
+                self.error(rhs, f"Cannot assign {rhs_type!r} to {lhs_type!r}")
+            return
+
         name = text(lhs)
         if not env.is_mutable(name):
             self.error(lhs, f"Cannot assign to final variable '{name}'")
@@ -641,6 +690,16 @@ class JavaTypeChecker:
     def _check_update(self, node: Node, env: Env):
         operand = named_children(node)[0] if named_children(node) else None
         if operand is None: return
+
+        # Compound targets: arr[i]++ , obj.field++ — infer the operand type.
+        if operand.type in ("array_access", "field_access"):
+            typ = self._infer(operand, env)
+            if typ not in (TOP, EMPTY):
+                unboxed = _UNBOXED.get(typ, typ) if isinstance(typ, ClassType) else typ
+                if not is_numeric(unboxed):
+                    self.error(operand, f"++/-- requires numeric type, got {typ!r}")
+            return
+
         name = text(operand)
         typ = env.lookup(name)
         if not env.is_mutable(name):
@@ -1024,9 +1083,43 @@ class JavaTypeChecker:
     # Field access
     # -----------------------------------------------------------------------
 
+    # Receiver shapes that are themselves expressions worth checking for
+    # their own errors (a bare identifier may be a class/package name, so we
+    # do not recurse into it — the LSP resolves the member directly).
+    _COMPOUND_RECEIVERS = (
+        "method_invocation", "array_access", "parenthesized_expression",
+        "object_creation_expression", "cast_expression", "field_access",
+    )
+
     def _infer_field_access(self, node: Node, env: Env) -> Type:
         obj = node.child_by_field_name("object")
         fld = node.child_by_field_name("field")
+
+        if self.resolver is not None and fld is not None:
+            # Check a compound receiver for its own internal errors.
+            if obj is not None and obj.type in self._COMPOUND_RECEIVERS:
+                self._infer(obj, env)
+            matches = self.resolver.match(text(fld), fld)
+            if not matches:
+                self.error(fld,
+                    f"Cannot resolve member '{text(fld)}'"
+                    f"{f' on {text(obj)}' if obj else ''}")
+                return EMPTY
+            # A field access must name a field / enum constant / nested type —
+            # not a method.  Bare ``obj.method`` (no call) is not valid here.
+            non_callable = [c for c in matches if not c.is_callable]
+            if not non_callable:
+                self.error(fld,
+                    f"'{text(fld)}' is a method and must be called "
+                    f"(did you mean {text(fld)}()?)")
+                return EMPTY
+            for ci in non_callable:
+                rt = ci.return_type_str
+                if rt:
+                    return java_type_from_string(rt)
+            return TOP  # matched (e.g. class-like) but no value type
+
+        # --- fallback: flat env with concatenated name ---
         full = f"{text(obj)}.{text(fld)}" if obj and fld else text(node)
         typ = env.lookup(full)
         if typ is None:
@@ -1043,20 +1136,134 @@ class JavaTypeChecker:
         method_node = node.child_by_field_name("name")
         args_node   = node.child_by_field_name("arguments")
 
-        full_name = (f"{text(obj_node)}.{text(method_node)}"
-                     if obj_node else
-                     text(method_node) if method_node else "")
-
-        candidates = env.lookup_all(full_name)
-        if not candidates:
-            self.error(node, f"Unknown method '{full_name}'")
-            return EMPTY
-
         args = ([c for c in named_children(args_node)
                  if c.type not in ("(", ")", ",")]
                 if args_node else [])
         arg_types = [self._infer(a, env) for a in args]
+
+        if self.resolver is not None and method_node is not None:
+            # Check a compound receiver (e.g. getList().add(...)) for errors.
+            if obj_node is not None and obj_node.type in self._COMPOUND_RECEIVERS:
+                self._infer(obj_node, env)
+            matches = [c for c in self.resolver.match(text(method_node), method_node)
+                       if c.is_callable]
+            if matches:
+                return self._resolve_lsp_overload(
+                    node, args_node, text(method_node), matches, args, arg_types)
+            # Fall back to a locally-declared method (same source) before erroring.
+            local = env.lookup_all(text(method_node))
+            if local:
+                return self._resolve_overload(
+                    node, text(method_node), local, args, arg_types)
+            self.error(method_node,
+                f"Cannot resolve method '{text(method_node)}'"
+                f"{f' on {text(obj_node)}' if obj_node else ''}")
+            return EMPTY
+
+        # --- fallback: flat env with concatenated name ---
+        full_name = (f"{text(obj_node)}.{text(method_node)}"
+                     if obj_node else
+                     text(method_node) if method_node else "")
+        candidates = env.lookup_all(full_name)
+        if not candidates:
+            self.error(node, f"Unknown method '{full_name}'")
+            return EMPTY
         return self._resolve_overload(node, full_name, candidates, args, arg_types)
+
+    # -----------------------------------------------------------------------
+    # §15.12.2: overload resolution against LSP completion signatures
+    # -----------------------------------------------------------------------
+
+    def _arg_list_close(self, args_node: Optional[Node]) -> Optional[Node]:
+        """The ``)`` token node of an argument_list, for arity errors."""
+        if args_node is None:
+            return None
+        for c in reversed(args_node.children):
+            if c.type == ")":
+                return c
+        return None
+
+    def _lsp_params(self, ci: CompletionInfo) -> list[Type]:
+        return [java_type_from_string(s) for s in ci.param_type_strs]
+
+    def _resolve_lsp_overload(self, call_node: Node, args_node: Optional[Node],
+                              name: str, candidates: list[CompletionInfo],
+                              arg_nodes: list[Node],
+                              arg_types: list[Type]) -> Type:
+        n_args = len(arg_types)
+
+        def fits(ci: CompletionInfo) -> bool:
+            params = self._lsp_params(ci)
+            if ci.is_varargs:
+                fixed = params[:-1]
+                if n_args < len(fixed):
+                    return False
+                return all(self.assignable(p, a)
+                           for p, a in zip(fixed, arg_types))
+            return (n_args == len(params) and
+                    all(self.assignable(p, a)
+                        for p, a in zip(params, arg_types)))
+
+        matches = [ci for ci in candidates if fits(ci)]
+        if matches:
+            chosen = matches[0]
+            return (VOID if chosen.is_constructor
+                    else java_type_from_string(chosen.return_type_str))
+
+        # No overload fits — produce a precise range for the failure.
+        self._report_call_mismatch(call_node, args_node, name,
+                                   candidates, arg_nodes, arg_types)
+        # Best-effort return: first candidate's return type.
+        first = candidates[0]
+        return VOID if first.is_constructor else java_type_from_string(first.return_type_str)
+
+    def _report_call_mismatch(self, call_node: Node, args_node: Optional[Node],
+                              name: str, candidates: list[CompletionInfo],
+                              arg_nodes: list[Node], arg_types: list[Type]):
+        n_args = len(arg_types)
+        arities = [len(self._lsp_params(ci)) for ci in candidates]
+        varadic = any(ci.is_varargs for ci in candidates)
+
+        # Arity mismatch first (clearer message + range).
+        if not varadic and n_args not in arities:
+            min_a = min(arities)
+            if n_args > max(arities):
+                # too many args -> point at the first surplus argument
+                extra = max(arities)
+                target = arg_nodes[extra] if extra < len(arg_nodes) else call_node
+                self.error(target,
+                    f"'{name}' expects {self._arity_str(arities)} "
+                    f"argument(s), got {n_args}")
+                return
+            if n_args < min_a:
+                # too few args -> point at the closing ')'
+                target = self._arg_list_close(args_node) or call_node
+                self.error(target,
+                    f"'{name}' expects {self._arity_str(arities)} "
+                    f"argument(s), got {n_args}")
+                return
+
+        # Same arity, but a particular argument has the wrong type.
+        # Choose the candidate of matching arity and report the first bad arg.
+        same_arity = [ci for ci in candidates
+                      if len(self._lsp_params(ci)) == n_args]
+        target_ci = same_arity[0] if same_arity else candidates[0]
+        params = self._lsp_params(target_ci)
+        for i, (anode, atype) in enumerate(zip(arg_nodes, arg_types)):
+            if i < len(params) and not self.assignable(params[i], atype):
+                self.error(anode,
+                    f"Argument {i + 1} of '{name}': "
+                    f"expected {params[i]!r}, got {atype!r}")
+                return
+        # Fallback generic message.
+        self.error(call_node,
+            f"No matching overload for '{name}' with arg types "
+            f"({', '.join(repr(t) for t in arg_types)})")
+
+    @staticmethod
+    def _arity_str(arities: list[int]) -> str:
+        uniq = sorted(set(arities))
+        return str(uniq[0]) if len(uniq) == 1 else f"{min(uniq)}-{max(uniq)}"
 
     def _resolve_overload(self, call_node: Node, name: str,
                           candidates: list[Type],
@@ -1334,9 +1541,23 @@ class JavaTypeChecker:
 
     def _infer_object_creation(self, node: Node, env: Env) -> Type:
         type_node = node.child_by_field_name("type")
-        if type_node:
-            return parse_java_type(type_node)
-        return TOP
+        args_node = node.child_by_field_name("arguments")
+        cls_type  = parse_java_type(type_node) if type_node else TOP
+
+        args = ([c for c in named_children(args_node)
+                 if c.type not in ("(", ")", ",")]
+                if args_node else [])
+        arg_types = [self._infer(a, env) for a in args]
+
+        if self.resolver is not None and type_node is not None:
+            ctors = [c for c in self.resolver.match(text(type_node), type_node)
+                     if c.is_constructor]
+            if ctors:
+                # constructor "return type" is the class itself; reuse overload
+                # resolution purely for argument checking.
+                self._resolve_lsp_overload(
+                    node, args_node, text(type_node), ctors, args, arg_types)
+        return cls_type
 
 
 # ---------------------------------------------------------------------------
@@ -1345,11 +1566,43 @@ class JavaTypeChecker:
 
 def typecheck(source: str,
               extra_env: Optional[dict[str, tuple[Type, bool]]] = None,
-              hierarchy: Optional[ClassHierarchy] = None) -> list[TypeError_]:
+              hierarchy: Optional[ClassHierarchy] = None,
+              resolver: Optional[LspResolver] = None) -> list[TypeError_]:
+    """Type-check ``source``.
+
+    With no ``resolver``, member/method/constructor lookups fall back to the
+    flat-name environment (only pre-registered names resolve).  Pass an
+    ``LspResolver`` to resolve those against a real Java language server.
+    """
     h   = hierarchy or ClassHierarchy()
     env = make_default_env(h)
     if extra_env:
         for name, (typ, mut) in extra_env.items():
             env = env.add(name, typ, mut)
-    checker = JavaTypeChecker(env, h)
+    checker = JavaTypeChecker(env, h, resolver)
     return checker.check_program(source)
+
+
+def typecheck_with_lsp(source: str,
+                       project_root: str,
+                       relative_file_path: str,
+                       base_line: int = 0,
+                       base_col: int = 0,
+                       extra_env: Optional[dict[str, tuple[Type, bool]]] = None,
+                       hierarchy: Optional[ClassHierarchy] = None) -> list[TypeError_]:
+    """Convenience wrapper that starts a Java language server for one check.
+
+    ``source`` is treated as text occupying ``relative_file_path`` starting at
+    ``(base_line, base_col)``.  For checking a method body, point those at the
+    body's opening position and pass the body text as ``source``.
+    """
+    from multilspy import SyncLanguageServer
+    from multilspy.multilspy_config import MultilspyConfig
+    from multilspy.multilspy_logger import MultilspyLogger
+
+    config = MultilspyConfig.from_dict({"code_language": "java"})
+    lsp = SyncLanguageServer.create(config, MultilspyLogger(), project_root)
+    with lsp.start_server():
+        with lsp.open_file(relative_file_path):
+            resolver = LspResolver(lsp, relative_file_path, base_line, base_col)
+            return typecheck(source, extra_env, hierarchy, resolver)
