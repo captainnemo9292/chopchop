@@ -465,6 +465,36 @@ class JavaTypeChecker:
         return t == BOOLEAN or t == ClassType("Boolean") or t == TOP
 
     # -----------------------------------------------------------------------
+    # Name resolution: locally-declared first, then the LSP.
+    #
+    # The environment only holds what the traversal has declared so far
+    # (locals, parameters, methods defined in the checked source).  Every
+    # other name — fields, inherited members, imported/static names — is
+    # resolved by querying the language server at the identifier's position.
+    # -----------------------------------------------------------------------
+
+    def _name_is_local(self, name: str, env: Env) -> bool:
+        return env.lookup(name) is not None
+
+    def _resolve_name_type(self, name: str, node: Node,
+                           env: Env) -> Optional[Type]:
+        """Type of a bare name, or None if it cannot be resolved anywhere."""
+        local = env.lookup(name)
+        if local is not None:
+            return local
+        if self.resolver is not None:
+            # A value reference must not resolve to a method.
+            matches = [c for c in self.resolver.match(name, node)
+                       if not c.is_callable]
+            for ci in matches:
+                rt = ci.return_type_str
+                if rt:
+                    return java_type_from_string(rt)
+            if matches:
+                return TOP  # resolved (e.g. a type/var) but no value type
+        return None
+
+    # -----------------------------------------------------------------------
     # Entry point
     # -----------------------------------------------------------------------
 
@@ -627,14 +657,16 @@ class JavaTypeChecker:
             return
 
         name = text(lhs)
-        if not env.is_mutable(name):
+        # final-ness is only known for names declared during the traversal
+        if self._name_is_local(name, env) and not env.is_mutable(name):
             self.error(lhs, f"Cannot assign to final variable '{name}'")
             return
-        lhs_type = env.lookup(name)
+        lhs_type = self._resolve_name_type(name, lhs, env)
         if lhs_type is None:
-            self.error(lhs, f"Undeclared variable '{name}'"); return
+            self.error(lhs, f"Cannot resolve symbol '{name}'"); return
         rhs_type = self._infer(rhs, env)
-        if not self.assignable_with_constant(lhs_type, rhs_type, rhs):
+        if lhs_type != TOP and \
+                not self.assignable_with_constant(lhs_type, rhs_type, rhs):
             self.error(rhs,
                 f"Cannot assign {rhs_type!r} to {lhs_type!r} (variable '{name}')")
 
@@ -649,11 +681,11 @@ class JavaTypeChecker:
         children = named_children(node)
         lhs, rhs = children[0], children[1]
         name = text(lhs)
-        if not env.is_mutable(name):
+        if self._name_is_local(name, env) and not env.is_mutable(name):
             self.error(lhs, f"Cannot use compound assignment on final '{name}'"); return
-        lhs_type = env.lookup(name)
+        lhs_type = self._resolve_name_type(name, lhs, env)
         if lhs_type is None:
-            self.error(lhs, f"Undeclared variable '{name}'"); return
+            self.error(lhs, f"Cannot resolve symbol '{name}'"); return
 
         op_node = child_by_type(node, "+=", "-=", "*=", "/=", "%=",
                                  "&=", "|=", "^=", "<<=", ">>=", ">>>=")
@@ -701,10 +733,12 @@ class JavaTypeChecker:
             return
 
         name = text(operand)
-        typ = env.lookup(name)
-        if not env.is_mutable(name):
+        if self._name_is_local(name, env) and not env.is_mutable(name):
             self.error(operand, f"Cannot increment/decrement final '{name}'")
-        if typ:
+        typ = self._resolve_name_type(name, operand, env)
+        if typ is None:
+            self.error(operand, f"Cannot resolve symbol '{name}'"); return
+        if typ != TOP:
             unboxed = _UNBOXED.get(typ, typ) if isinstance(typ, ClassType) else typ
             if not is_numeric(unboxed):
                 self.error(operand, f"++/-- requires numeric type, got {typ!r}")
@@ -1024,9 +1058,9 @@ class JavaTypeChecker:
 
             case "identifier":
                 name = text(node)
-                typ = env.lookup(name)
+                typ = self._resolve_name_type(name, node, env)
                 if typ is None:
-                    self.error(node, f"Undeclared variable '{name}'")
+                    self.error(node, f"Cannot resolve symbol '{name}'")
                     return EMPTY
                 return typ
 
